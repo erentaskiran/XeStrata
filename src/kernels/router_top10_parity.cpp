@@ -104,9 +104,14 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "usage: router_top10_parity [--selftest]\n"); return 2; }
     }
 
-    const int NE = 512;          // the real n_expert
-    const int K = 10;            // the real top-k
-    const int NT = 64;
+    // ROUTER_NE, ROUTER_K, ROUTER_NT: another shape (Qwen3.6-35B-A3B's is 256 experts, top 8)
+    const auto env_int = [](const char* name, int dflt) {
+        const char* v = std::getenv(name);
+        return v != nullptr ? (int) std::strtol(v, nullptr, 10) : dflt;
+    };
+    const int NE = env_int("ROUTER_NE", 512);   // the real n_expert
+    const int K = env_int("ROUTER_K", 10);      // the real top-k
+    const int NT = env_int("ROUTER_NT", 64);
     std::mt19937 rng(2024);
     std::normal_distribution<float> gauss(0.0f, 1.0f);
     int bad = 0;

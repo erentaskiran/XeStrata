@@ -146,6 +146,86 @@ sycl::event router_top10_launch(sycl::queue& q, const float* logits, int n_token
         });
     });
 }
+
+// One sub-group per token, NPL values a lane in registers (expert lane + 32 j): the same max, the same exponentials,
+// the same ascending sum (each value broadcast in expert order), the same k stable argmax passes and renormalisation
+// as router_top10_launch, without its local memory and barriers.  B580, 8192 tokens x 256 experts, top 8: the
+// work-group version took ~1.1 ms a call (88 ms of a 15K prompt).
+template <typename D, int NPL>
+sycl::event router_topk_sg_launch(sycl::queue& q, const float* logits, int n_tokens, int n_expert, int k, int* ids,
+                                  float* weights) {
+    constexpr int TPG = 8;   // tokens (sub-groups) a work-group
+    const size_t groups = ((size_t) n_tokens + TPG - 1) / TPG;
+    return q.parallel_for(sycl::nd_range<1>(groups * TPG * WARP, TPG * WARP),
+                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int t = (int) (it.get_group(0) * TPG + sg.get_group_linear_id());
+        if (t >= n_tokens) return;
+        const int lane = (int) sg.get_local_linear_id();
+        const float* l = logits + (size_t) t * n_expert;
+        float v[NPL];
+        float mx = -INFINITY;
+#pragma unroll
+        for (int j = 0; j < NPL; ++j) {
+            const int x = lane + WARP * j;
+            v[j] = x < n_expert ? l[x] : -INFINITY;
+            mx = sycl::fmax(mx, v[j]);
+        }
+        mx = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
+        D ex[NPL];
+#pragma unroll
+        for (int j = 0; j < NPL; ++j) ex[j] = (lane + WARP * j) < n_expert ? sycl::exp((D) v[j] - (D) mx) : (D) 0;
+        D sum = 0;   // ascending in expert order: expert lane + 32 j is lane `lane` of value j
+#pragma unroll
+        for (int j = 0; j < NPL; ++j)
+            for (int ln = 0; ln < WARP; ++ln)
+                if (ln + WARP * j < n_expert) sum += sycl::select_from_group(sg, ex[j], ln);
+        const float inv = (float) ((D) 1 / sum);
+        float p[NPL];
+#pragma unroll
+        for (int j = 0; j < NPL; ++j) p[j] = (lane + WARP * j) < n_expert ? (float) (ex[j] * inv) : -INFINITY;
+        unsigned taken = 0;
+        float wsel[16];
+        int isel[16];
+        for (int i = 0; i < k; ++i) {
+            float bv = -INFINITY;
+            int bi = n_expert;
+#pragma unroll
+            for (int j = 0; j < NPL; ++j) {
+                const int x = lane + WARP * j;
+                if (x < n_expert && !((taken >> j) & 1u) && p[j] > bv) { bv = p[j]; bi = x; }
+            }
+            for (int off = 16; off > 0; off >>= 1)
+                better(bv, bi, sycl::permute_group_by_xor(sg, bv, off), sycl::permute_group_by_xor(sg, bi, off));
+            wsel[i] = bv;
+            isel[i] = bi;
+            if (bi < n_expert && (bi % WARP) == lane) taken |= 1u << (bi / WARP);
+        }
+        if (lane == 0) {
+            D s = 0;
+            for (int i = 0; i < k; ++i) s += (D) wsel[i];
+            const D sc = sycl::fmax(s, (D) 6.103515625e-05);   // 2**-14
+            for (int i = 0; i < k; ++i) {
+                if (isel[i] >= n_expert) continue;   // as the work-group version: an empty pass writes nothing
+                ids[(size_t) t * k + i] = isel[i];
+                weights[(size_t) t * k + i] = (float) ((D) wsel[i] / sc);
+            }
+        }
+    });
+}
+
+bool router_topk_sg(sycl::queue& q, bool fp64, const float* logits, int n_tokens, int n_expert, int k, int* ids,
+                    float* weights, sycl::event& e) {
+    static const bool off = [] { const char* v = std::getenv("STRATA_ROUTER_SG"); return v && v[0] == '0'; }();
+    if (off || k > 16 || n_expert > 16 * WARP) return false;
+    if (n_expert <= 8 * WARP)
+        e = fp64 ? router_topk_sg_launch<double, 8>(q, logits, n_tokens, n_expert, k, ids, weights)
+                 : router_topk_sg_launch<float, 8>(q, logits, n_tokens, n_expert, k, ids, weights);
+    else
+        e = fp64 ? router_topk_sg_launch<double, 16>(q, logits, n_tokens, n_expert, k, ids, weights)
+                 : router_topk_sg_launch<float, 16>(q, logits, n_tokens, n_expert, k, ids, weights);
+    return true;
+}
 }  // namespace
 
 // One work-group per token.  See the CUDA file for why each step is shaped as it is: the max is an exact tree, the
@@ -162,6 +242,11 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
     threads = (threads + WARP - 1) & ~(WARP - 1);                  // whole sub-groups, for the reductions
     const int nw = threads / WARP;
     auto& q = queue_for(stream, false);
+    sycl::event es;
+    if (router_topk_sg(q, xe::has_fp64(q), logits, n_tokens, n_expert, k, ids, weights, es)) {
+        if (!stream) core::Runtime::get().wait(es, "router_top10");
+        return;
+    }
     const auto e = xe::has_fp64(q)
                        ? router_top10_launch<double>(q, logits, n_tokens, n_expert, k, ids, weights, threads, nw)
                        : router_top10_launch<float>(q, logits, n_tokens, n_expert, k, ids, weights, threads, nw);
