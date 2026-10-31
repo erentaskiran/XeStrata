@@ -735,6 +735,8 @@ private:
     strata::gpu::Event* swap_ev_ = nullptr;
     struct PendingSwap { int32_t layer, expert, slot; };
     std::vector<PendingSwap> pending_;
+    bool return_pending_ = false;    ///< pending_ holds prompt_return's copies: settle_window polls them, never waits
+    bool settle_deferred_ = false;   ///< prompt_settle's round, run once those copies have landed
     std::vector<strata::gpu::Graph*> exec_;                      ///< per T: the whole window
     std::vector<std::vector<strata::gpu::Graph*>> segs_;         ///< per T: the segments (MoeWindow::segmented)
     std::vector<strata::gpu::Graph*> mexec_;                     ///< per T: the MTP layer

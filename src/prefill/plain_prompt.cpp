@@ -181,24 +181,38 @@ bool PlainModel::prompt_return(std::string& err) {
     if (!strata::gpu::stream_sync(cs_)) { err = std::string("plain prompt: ") + strata::gpu::last_error(); return false; }
     for (int64_t s = borrow_first_; s < n; ++s) free_[(size_t) slot_layer_[(size_t) s]].push_back((int32_t) s);
     borrow_first_ = -1;
-    // the experts the prompt displaced, back into the slots: straight from pinned RAM, else through fill_slot
+    // the experts the prompt displaced, back into the slots: straight from pinned RAM, else through fill_slot.  The
+    // pinned ones on the tier's copy stream as pending swaps (STRATA_RETURN_ASYNC=0: in line): the first token does
+    // not wait for them, the decode reads those experts from RAM until settle_window finds them landed.  B580,
+    // Qwen3.6-35B-A3B UD-IQ3_S, 15K tokens: the copies in line took 320 ms before the first token
+    static const bool async_ret = [] { const char* v = std::getenv("STRATA_RETURN_ASYNC"); return !(v && v[0] == '0'); }();
+    const bool by_swap = async_ret && swap_cs_ != nullptr && swap_ev_ != nullptr && pending_.empty();
     for (const auto& [l, e] : borrowed_res_) {
         auto& f = free_[(size_t) l];
         if (f.empty()) break;
         const uint8_t* hb = src_->transient(l, e) ? nullptr : src_->blob(l, e);
         if (hb != nullptr && (strata::gpu::is_host_usm(hb) || (dev_ >= 0 && src_->registered_on(dev_)))) {
             const int32_t slot = f.back();
-            if (!strata::gpu::copy_async(cache_.device_slot(slot), hb, lay.blob_bytes(l), cs_)) {
+            if (!strata::gpu::copy_async(cache_.device_slot(slot), hb, lay.blob_bytes(l), by_swap ? swap_cs_ : cs_)) {
                 err = std::string("plain prompt: ") + strata::gpu::last_error();
                 return false;
             }
             f.pop_back();
-            res_[(size_t) (l * spec_.n_expert + e)] = slot;
+            if (by_swap) pending_.push_back({(int32_t) l, e, slot});
+            else res_[(size_t) (l * spec_.n_expert + e)] = slot;
         } else if (!fill_slot(l, e, err)) {
             return false;
         }
     }
     borrowed_res_.clear();
+    if (by_swap && !pending_.empty()) {
+        if (!strata::gpu::event_record(swap_ev_, swap_cs_)) {
+            err = std::string("plain prompt: ") + strata::gpu::last_error();
+            return false;
+        }
+        pending_age_ = 0;
+        return_pending_ = true;
+    }
     if (!strata::gpu::stream_sync(cs_)) { err = std::string("plain prompt: ") + strata::gpu::last_error(); return false; }
     return true;
 }
@@ -215,6 +229,10 @@ bool PlainModel::prompt_settle(std::string& err) {
     if (disp_.usage.empty()) return true;
     seed_usage(disp_.usage, prompt_routed_, spec_.n_expert_used, prompt_seen_, spec_.n_expert, 4 * (int64_t) opt_.adapt_every,
                opt_.adapt_decay);
+    if (return_pending_) {   // the slots are still being written back: the round once they have landed (settle_window)
+        settle_deferred_ = true;
+        return true;
+    }
     int64_t n_free = 0;
     for (const auto& f : free_) n_free += (int64_t) f.size();
     return (n_free == 0 && opt_.adapt_swaps <= 0) || adapt(err, std::max<int64_t>(n_free, opt_.adapt_swaps), opt_.adapt_swaps);

@@ -2701,6 +2701,17 @@ bool PlainModel::adapt(std::string& err, int64_t max_swaps, int64_t max_evict) {
 constexpr int kPlainAdaptLag = 3;
 
 bool PlainModel::settle_window(std::string& err) {
+    if (return_pending_ && !settle_swaps(false, err)) return false;   // the prompt's copies back: polled, never waited for
+    if (return_pending_) return true;
+    if (settle_deferred_) {   // the prompt's round (prompt_settle), now that its slots are the tier's again
+        settle_deferred_ = false;
+        int64_t n_free = 0;
+        for (const auto& f : free_) n_free += (int64_t) f.size();
+        if (!((n_free == 0 && opt_.adapt_swaps <= 0) ||
+              adapt(err, std::max<int64_t>(n_free, opt_.adapt_swaps), opt_.adapt_swaps)))
+            return false;
+        return true;
+    }
     if (pending_.empty()) return settle_swaps(false, err);   // a round of blocking fills: its exchanges commit
     return ++pending_age_ < adapt_lag(kPlainAdaptLag) || settle_swaps(true, err);
 }
@@ -2717,6 +2728,7 @@ bool PlainModel::settle_swaps(bool wait, std::string& err) {
     }
     for (const PendingSwap& p : pending_) res_[(size_t) (p.layer * spec_.n_expert + p.expert)] = p.slot;
     pending_.clear();
+    return_pending_ = false;
     if (complement_ != nullptr) complement_->commit_exchanges();
     return true;
 }
